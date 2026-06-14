@@ -5,16 +5,52 @@
 #include <nrfx_timer.h>
 #include <Servo.h>
 
+// Kalman filter (pure C library in lib/Kalman). Pulled in with C linkage so this
+// C++ translation unit links against the C-compiled sources, following the
+// library README's "copy-paste sources" usage with single-TU static inlines.
+extern "C" {
+#define EXTERN_INLINE_MATRIX static inline
+#define EXTERN_INLINE_KALMAN static inline
+#include <kalman.h>
+
+// One filter named "altitude": 3 states [altitude, velocity, acceleration], 0 inputs.
+#define KALMAN_NAME altitude
+#define KALMAN_NUM_STATES 3
+#define KALMAN_NUM_INPUTS 0
+#include <kalman_factory_filter.h>
+
+// One measurement named "baro": the single barometric altitude reading.
+#define KALMAN_MEASUREMENT_NAME baro
+#define KALMAN_NUM_MEASUREMENTS 1
+#include <kalman_factory_measurement.h>
+
+#include <kalman_factory_cleanup.h>
+}
+
 #define SAMPLE_PERIOD_MS 10
 #define TRANSMIT_PERIOD_MS 200UL
 #define TRANSMIT_TICKS (TRANSMIT_PERIOD_MS / SAMPLE_PERIOD_MS) // Transmit interval in ticks
 
 #define ALT_SAMPLES_ARRAY_LENGTH 40 // the receiver screen can only show 40 points
 
-// Flight detection tuning all in meters
-#define LAUNCH_ALTITUDE_THRESHOLD 2.0f // climb above this => launch detected
-#define APOGEE_DESCENT_THRESHOLD 1.0f // drop this far below peak => falling
-#define DESCENT_CONFIRM_SAMPLES 5 // consecutive falling samples to confirm
+// Flight detection tuning
+#define SAMPLE_DT_S (SAMPLE_PERIOD_MS / 1000.0f) // Kalman time step (s)
+#define LAUNCH_ALTITUDE_THRESHOLD 2.0f // climb above this => start logging (m)
+#define LAUNCH_VELOCITY_THRESHOLD 2.0f // upward speed above this => real boost seen (m/s)
+
+// Kalman tuning. R is the barometric measurement noise; lambda (<1) injects
+// process noise so the filter keeps trusting new readings instead of rigidly
+// extrapolating its own trajectory.
+#define KF_MEAS_VARIANCE 1.0f // R: altitude measurement variance (m^2)
+#define KF_INIT_VARIANCE 1.0f // initial diagonal of the state covariance P
+#define KF_LAMBDA 0.98f       // fading-memory factor, 0 < lambda <= 1
+
+// Apogee prediction: deploy as the filtered velocity is about to cross zero. The
+// lead time fires the chute just before the geometric peak, so it is already out
+// before the airframe can tilt over and start to fall.
+#define APOGEE_LEAD_TIME_S 0.15f // deploy this long before predicted apogee (s)
+#define APOGEE_CONFIRM_SAMPLES 3 // consecutive apogee detections to confirm
+
 #define ARM_DELAY_MS 7000UL // wait 7s after the button press before zeroing altitude
 
 // automatic disarm
@@ -44,8 +80,17 @@ int16_t max_timeframe_altitude = 0;
 bool is_armed = false;
 bool is_flying = false;
 bool is_falling = false;
-float peak_altitude = 0.0f; 
-uint16_t descent_count = 0;
+bool boost_detected = false;   // a clear upward boost has been seen this flight
+float peak_altitude = 0.0f;    // recorded apogee altitude (m)
+uint16_t apogee_count = 0;     // consecutive apogee detections
+
+// Latest Kalman estimate, refreshed every flight cycle.
+float kf_altitude = 0.0f;
+float kf_velocity = 0.0f;
+float kf_accel = 0.0f;
+
+kalman_t* kf = nullptr;
+kalman_measurement_t* kfm = nullptr;
 
 int16_t altitude_samples[ALT_SAMPLES_ARRAY_LENGTH] = {0};
 uint16_t altitude_sample_idx = 0;
@@ -63,6 +108,8 @@ void send_to_ground(int16_t altitude);
 void panic(const char* msg);
 void handle_sensor_reading(void);
 void flight_engine_routine(void);
+void kalman_setup(void);
+void kalman_reset(void);
 void handle_button_press(void);
 void button_update(void);
 void servo_goto(int angle);
@@ -110,6 +157,8 @@ void setup()
     sensor_init(&sensor, &Wire1, BMP280_I2C_ADDR_PRIM);
     if (!sensor_begin(&sensor)) panic("BMP280 init failed");
 
+    kalman_setup();
+
     int radio_state = radio.begin(
         868.0, // freq MHz
         250.0, // BW kHz
@@ -155,7 +204,15 @@ void loop()
         }
 
         max_timeframe_altitude = 0;
-        Serial.println(sensor.altitude);
+        // Debug telemetry over USB serial: raw vs filtered altitude, plus the
+        // estimated vertical velocity and acceleration used for apogee timing.
+        Serial.print(sensor.altitude);
+        Serial.print(' ');
+        Serial.print(kf_altitude);
+        Serial.print(' ');
+        Serial.print(kf_velocity);
+        Serial.print(' ');
+        Serial.println(kf_accel);
     }
 
     if (auto_disarm_countdown == 0 && is_armed) {
@@ -231,33 +288,59 @@ void handle_sensor_reading(void)
 
 void flight_engine_routine(void)
 {
-    float alt = sensor.altitude;
+    // Run one Kalman step on the latest barometric altitude: predict the state
+    // forward one sample, then correct it with the new measurement. The tuned
+    // predict injects process noise (lambda) so the velocity and acceleration
+    // estimates stay responsive instead of locking onto a stale trajectory.
+    kalman_predict_tuned(kf, KF_LAMBDA);
+    matrix_set(kalman_get_measurement_vector(kfm), 0, 0, sensor.altitude);
+    kalman_correct(kf, kfm);
 
-    if (alt > max_timeframe_altitude) {
-        max_timeframe_altitude = (int16_t)alt;
+    const matrix_t* x = kalman_get_state_vector(kf);
+    kf_altitude = matrix_get(x, 0, 0);
+    kf_velocity = matrix_get(x, 1, 0);
+    kf_accel    = matrix_get(x, 2, 0);
+
+    // Track the peak filtered altitude for the telemetry graph.
+    if (kf_altitude > max_timeframe_altitude) {
+        max_timeframe_altitude = (int16_t)kf_altitude;
     }
 
-    // Launch detection 
-    if (!is_flying && alt > LAUNCH_ALTITUDE_THRESHOLD) {
+    // Launch detection: start logging once we clearly leave the pad.
+    if (!is_flying && kf_altitude > LAUNCH_ALTITUDE_THRESHOLD) {
         is_flying = true;
-        peak_altitude = alt;
         altitude_sample_idx = 0;
     }
 
-    // descent detection
-    if (is_flying && !is_falling) {
-        if (alt > peak_altitude) {
-            peak_altitude = alt;      // still climbing, update the peak
-            descent_count = 0;
-        } else if (alt < peak_altitude - APOGEE_DESCENT_THRESHOLD) {
-            // Falling far enough below the peak; require several consecutive
-            // samples so a single noisy reading can't trigger early.
-            if (++descent_count >= DESCENT_CONFIRM_SAMPLES) {
+    // Boost detection: only arm apogee prediction once a real upward burn is
+    // seen, so pad noise (velocity hovering around zero) can never deploy.
+    if (!boost_detected && kf_velocity > LAUNCH_VELOCITY_THRESHOLD) {
+        boost_detected = true;
+    }
+
+    // Apogee prediction and parachute deployment.
+    if (is_flying && boost_detected && !is_falling) {
+        // Apogee is where vertical velocity crosses zero. While coasting the
+        // craft decelerates (accel < 0), so the time until velocity reaches
+        // zero is -v/a. Deploy once that is within the lead time, or once the
+        // peak has already been reached (v <= 0).
+        bool apogee_now = (kf_velocity <= 0.0f);
+        bool apogee_imminent = false;
+        if (kf_accel < 0.0f) {
+            float time_to_apogee = -kf_velocity / kf_accel;
+            apogee_imminent = (time_to_apogee <= APOGEE_LEAD_TIME_S);
+        }
+
+        if (apogee_now || apogee_imminent) {
+            // Require a few consecutive detections so one noisy estimate can't
+            // fire the chute early.
+            if (++apogee_count >= APOGEE_CONFIRM_SAMPLES) {
+                peak_altitude = kf_altitude;
                 is_falling = true;    // deploy parachute
                 is_armed = false;
             }
         } else {
-            descent_count = 0;        // within noise band, not a real descent
+            apogee_count = 0;
         }
     }
 }
@@ -285,8 +368,9 @@ void handle_button_press(void)
     is_flying = false;
     is_falling = false;
     samples_transmitted = false;
-    descent_count = 0;
-    
+    boost_detected = false;
+    apogee_count = 0;
+
     if (is_armed) {
         is_armed = false;
     } else {
@@ -297,6 +381,7 @@ void handle_button_press(void)
         is_armed = true;
         auto_disarm_countdown = AUTO_DISARM_TICKS;
         sensor_reset_altitude(&sensor);
+        kalman_reset();   // start the filter from rest at the new zero altitude
     }
 }
 
@@ -316,4 +401,57 @@ void handle_transmit_samples(void)
     for (uint16_t i = 0; i < altitude_sample_idx; i++) {
         send_to_ground(altitude_samples[i]);
     }
+}
+
+// Configure the constant Kalman matrices once at startup. The model is a
+// constant-acceleration kinematics model sampled every SAMPLE_DT_S seconds:
+//   altitude += velocity*dt + 0.5*accel*dt^2
+//   velocity += accel*dt
+//   accel    += 0            (driven only by process noise)
+void kalman_setup(void)
+{
+    kf  = kalman_filter_altitude_init();
+    kfm = kalman_filter_altitude_measurement_baro_init();
+
+    const float dt = SAMPLE_DT_S;
+
+    // State transition matrix A.
+    matrix_t* A = kalman_get_state_transition(kf);
+    matrix_set(A, 0, 0, 1.0f); matrix_set(A, 0, 1, dt);   matrix_set(A, 0, 2, 0.5f * dt * dt);
+    matrix_set(A, 1, 0, 0.0f); matrix_set(A, 1, 1, 1.0f); matrix_set(A, 1, 2, dt);
+    matrix_set(A, 2, 0, 0.0f); matrix_set(A, 2, 1, 0.0f); matrix_set(A, 2, 2, 1.0f);
+
+    // We observe altitude only: H = [1 0 0].
+    matrix_t* H = kalman_get_measurement_transformation(kfm);
+    matrix_set(H, 0, 0, 1.0f);
+    matrix_set(H, 0, 1, 0.0f);
+    matrix_set(H, 0, 2, 0.0f);
+
+    // Measurement noise covariance R.
+    matrix_set(kalman_get_process_noise(kfm), 0, 0, KF_MEAS_VARIANCE);
+
+    kalman_reset();
+}
+
+// Reset the filter to "at rest at altitude zero" with a fresh covariance. Called
+// on every arm so each flight starts clean.
+void kalman_reset(void)
+{
+    matrix_t* x = kalman_get_state_vector(kf);
+    matrix_set(x, 0, 0, 0.0f);
+    matrix_set(x, 1, 0, 0.0f);
+    matrix_set(x, 2, 0, 0.0f);
+
+    matrix_t* P = kalman_get_system_covariance(kf);
+    for (uint_fast8_t r = 0; r < 3; r++) {
+        for (uint_fast8_t c = 0; c < 3; c++) {
+            matrix_set(P, r, c, (r == c) ? KF_INIT_VARIANCE : 0.0f);
+        }
+    }
+
+    kf_altitude = 0.0f;
+    kf_velocity = 0.0f;
+    kf_accel = 0.0f;
+    apogee_count = 0;
+    boost_detected = false;
 }

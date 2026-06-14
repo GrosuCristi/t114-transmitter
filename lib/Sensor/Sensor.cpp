@@ -74,9 +74,15 @@ bool sensor_begin(Sensor* s)
         return false;
     }
 
-    s->conf.os_pres = BMP280_OS_16X;           // high-res pressure for altitude
-    s->conf.os_temp = BMP280_OS_2X;
-    s->conf.filter = BMP280_FILTER_COEFF_16;  // drop to COEFF_2 for fast ascent
+    // Tuned for fast dynamics (apogee detection), not static resolution. Heavy
+    // oversampling + a high IIR coefficient add hundreds of ms of group delay,
+    // which makes the Kalman velocity estimate (and therefore apogee deploy) lag
+    // by ~0.5 s. We keep the sensor fast/low-latency and let the Kalman do the
+    // smoothing. os_pres 4x => fresh data ~every 10 ms to match the sample loop;
+    // COEFF_2 is light hardware smoothing only.
+    s->conf.os_pres = BMP280_OS_4X;            // fast pressure read (~10 ms conversion)
+    s->conf.os_temp = BMP280_OS_1X;            // temperature drifts slowly; 1x is plenty
+    s->conf.filter = BMP280_FILTER_COEFF_2;    // minimal IIR lag (was COEFF_16)
     s->conf.odr = BMP280_ODR_0_5_MS;
     s->conf.spi3w_en = 0;
 
