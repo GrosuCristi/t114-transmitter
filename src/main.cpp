@@ -59,10 +59,30 @@ extern "C" {
 
 // Parachute servo
 #define SERVO_PIN 33
-#define SERVO_CLOSED_ANGLE 10 // degrees: cover latched shut
-#define SERVO_OPEN_ANGLE 100 // degrees: cover released
+#define SERVO_CLOSED_ANGLE 100 // degrees: cover latched shut
+#define SERVO_OPEN_ANGLE 10 // degrees: cover released
 #define SERVO_MOVE_TIME_MS 750UL // travel time before detaching (no position feedback)
 #define SERVO_MOVE_TICKS (SERVO_MOVE_TIME_MS / SAMPLE_PERIOD_MS) // travel time in timer1 ticks
+
+// Deployment profile. Two strategies depending on how high the flight got:
+//  - Low flights have no room to coast, so the chute comes out right at apogee.
+//  - Tall flights coast down and deploy lower to cut drift under canopy. A
+//    descent-speed fallback still forces deployment if a long ballistic free
+//    fall builds up dangerous speed before the target altitude is reached.
+#define H_LOW_THRESHOLD_M    20.0f   // apogee below this => deploy at apogee (m)
+#define H_DEPLOY_TARGET_M    20.0f   // on descent, deploy at/below this altitude (m)
+#define V_SAFETY_FALLBACK_MS -30.0f  // deploy if descent speed exceeds this (m/s)
+
+// Flight phase state machine. The single source of truth for where we are in
+// the flight; parachute deployment and telemetry logging both key off it.
+//   IDLE -> ASCENDING -> APOGEE_DETECTED -> DESCENDING -> DEPLOYED
+enum flight_state_t {
+    FLIGHT_IDLE,            // on the pad, waiting to leave
+    FLIGHT_ASCENDING,       // climbing; watching for apogee
+    FLIGHT_APOGEE_DETECTED, // peak reached; choosing a deploy strategy
+    FLIGHT_DESCENDING,      // coasting down toward the deploy altitude
+    FLIGHT_DEPLOYED,        // chute released (terminal)
+};
 
 /*******************************************************************************
 Globals
@@ -78,10 +98,11 @@ volatile bool sensor_due = false;
 int16_t max_timeframe_altitude = 0;
 
 bool is_armed = false;
-bool is_flying = false;
-bool is_falling = false;
+flight_state_t flight_state = FLIGHT_IDLE;
 bool boost_detected = false;   // a clear upward boost has been seen this flight
-float peak_altitude = 0.0f;    // recorded apogee altitude (m)
+float max_altitude = 0.0f;     // highest filtered altitude this flight (m)
+float peak_altitude = 0.0f;    // apogee altitude recorded at deployment (m)
+float deploy_altitude = 0.0f;  // filtered altitude at deployment, for logging (m)
 uint16_t apogee_count = 0;     // consecutive apogee detections
 
 // Latest Kalman estimate, refreshed every flight cycle.
@@ -108,6 +129,7 @@ void send_to_ground(int16_t altitude);
 void panic(const char* msg);
 void handle_sensor_reading(void);
 void flight_engine_routine(void);
+void deploy_parachute(void);
 void kalman_setup(void);
 void kalman_reset(void);
 void handle_button_press(void);
@@ -198,7 +220,8 @@ void loop()
     if (transmit_countdown == 0 ) {
         transmit_countdown = TRANSMIT_TICKS;
 
-        if (is_flying && !is_falling && altitude_sample_idx < ALT_SAMPLES_ARRAY_LENGTH) {
+        if (flight_state != FLIGHT_IDLE && flight_state != FLIGHT_DEPLOYED &&
+            altitude_sample_idx < ALT_SAMPLES_ARRAY_LENGTH) {
             altitude_samples[altitude_sample_idx] = max_timeframe_altitude;
             altitude_sample_idx++;
         }
@@ -230,7 +253,7 @@ void loop()
     button_update();
 
     // transmit samples array
-    if (is_flying && is_falling && !samples_transmitted) {
+    if (flight_state == FLIGHT_DEPLOYED && !samples_transmitted) {
         handle_transmit_samples();
         samples_transmitted = true;
     }
@@ -301,29 +324,52 @@ void flight_engine_routine(void)
     kf_velocity = matrix_get(x, 1, 0);
     kf_accel    = matrix_get(x, 2, 0);
 
-    // Track the peak filtered altitude for the telemetry graph.
+    // Track the peak filtered altitude for the telemetry graph and, separately,
+    // the highest altitude this flight (drives the apogee deploy-strategy branch).
     if (kf_altitude > max_timeframe_altitude) {
         max_timeframe_altitude = (int16_t)kf_altitude;
     }
-
-    // Launch detection: start logging once we clearly leave the pad.
-    if (!is_flying && kf_altitude > LAUNCH_ALTITUDE_THRESHOLD) {
-        is_flying = true;
-        altitude_sample_idx = 0;
+    if (kf_altitude > max_altitude) {
+        max_altitude = kf_altitude;
     }
 
-    // Boost detection: only arm apogee prediction once a real upward burn is
-    // seen, so pad noise (velocity hovering around zero) can never deploy.
-    if (!boost_detected && kf_velocity > LAUNCH_VELOCITY_THRESHOLD) {
-        boost_detected = true;
+    // Altitude-target deploy and missed-apogee failsafe. Once past the pad, at
+    // or below the deploy target, and clearly coming down from the peak, release
+    // the chute -- in any flight state. The "coming down" test uses how far we
+    // have fallen below the peak rather than the velocity sign, so it still
+    // fires if the velocity estimate has gone bad (the most likely reason apogee
+    // detection would have failed in the first place). That drop margin also
+    // stops it from firing on the way *up* through the target altitude.
+    if (flight_state != FLIGHT_IDLE && flight_state != FLIGHT_DEPLOYED &&
+        kf_altitude <= H_DEPLOY_TARGET_M &&
+        (max_altitude - kf_altitude) > LAUNCH_ALTITUDE_THRESHOLD) {
+        deploy_parachute();
+        return;
     }
 
-    // Apogee prediction and parachute deployment.
-    if (is_flying && boost_detected && !is_falling) {
+    switch (flight_state) {
+    case FLIGHT_IDLE:
+        // Leave the pad once we clearly climb above the launch threshold.
+        if (kf_altitude > LAUNCH_ALTITUDE_THRESHOLD) {
+            flight_state = FLIGHT_ASCENDING;
+            altitude_sample_idx = 0;
+        }
+        break;
+
+    case FLIGHT_ASCENDING: {
+        // Only trust apogee detection once a real upward burn is seen, so pad
+        // noise (velocity hovering around zero) can never deploy.
+        if (!boost_detected && kf_velocity > LAUNCH_VELOCITY_THRESHOLD) {
+            boost_detected = true;
+        }
+        if (!boost_detected) {
+            break;
+        }
+
         // Apogee is where vertical velocity crosses zero. While coasting the
         // craft decelerates (accel < 0), so the time until velocity reaches
-        // zero is -v/a. Deploy once that is within the lead time, or once the
-        // peak has already been reached (v <= 0).
+        // zero is -v/a. Flag apogee once that is within the lead time, or once
+        // the peak has already been reached (v <= 0).
         bool apogee_now = (kf_velocity <= 0.0f);
         bool apogee_imminent = false;
         if (kf_accel < 0.0f) {
@@ -335,14 +381,59 @@ void flight_engine_routine(void)
             // Require a few consecutive detections so one noisy estimate can't
             // fire the chute early.
             if (++apogee_count >= APOGEE_CONFIRM_SAMPLES) {
-                peak_altitude = kf_altitude;
-                is_falling = true;    // deploy parachute
-                is_armed = false;
+                flight_state = FLIGHT_APOGEE_DETECTED;
             }
         } else {
             apogee_count = 0;
         }
+        break;
     }
+
+    case FLIGHT_APOGEE_DETECTED:
+        // Branch on how high we got. Low flights have no room to coast, so the
+        // chute comes out at the peak. Tall flights wait and deploy lower.
+        if (max_altitude < H_LOW_THRESHOLD_M) {
+            deploy_parachute();
+        } else {
+            flight_state = FLIGHT_DESCENDING;
+        }
+        break;
+
+    case FLIGHT_DESCENDING:
+        // The target-altitude deploy is handled by the failsafe block above.
+        // This is the long-free-fall guard: a tall flight that builds up
+        // dangerous descent speed deploys immediately, before reaching target.
+        if (kf_velocity <= V_SAFETY_FALLBACK_MS) {
+            deploy_parachute();
+        }
+        break;
+
+    case FLIGHT_DEPLOYED:
+        // Chute is out; nothing left to do.
+        break;
+    }
+}
+
+// Release the parachute. Idempotent: safe to call on every tick. Disarming
+// opens the servo cover via the main-loop servo logic (armed => closed, else
+// open), and records where/why the chute came out for post-flight analysis.
+void deploy_parachute(void)
+{
+    if (flight_state == FLIGHT_DEPLOYED) {
+        return;
+    }
+
+    peak_altitude   = max_altitude;
+    deploy_altitude = kf_altitude;
+    flight_state    = FLIGHT_DEPLOYED;
+    is_armed        = false; // opens the cover (see servo logic in loop())
+
+    Serial.print("DEPLOY state-entry alt=");
+    Serial.print(deploy_altitude);
+    Serial.print(" peak=");
+    Serial.print(peak_altitude);
+    Serial.print(" v=");
+    Serial.println(kf_velocity);
 }
 
 void servo_goto(int angle)
@@ -365,11 +456,11 @@ void servo_update(void)
 
 void handle_button_press(void)
 {
-    is_flying = false;
-    is_falling = false;
+    flight_state = FLIGHT_IDLE;
     samples_transmitted = false;
     boost_detected = false;
     apogee_count = 0;
+    max_altitude = 0.0f;
 
     if (is_armed) {
         is_armed = false;
@@ -454,4 +545,6 @@ void kalman_reset(void)
     kf_accel = 0.0f;
     apogee_count = 0;
     boost_detected = false;
+    flight_state = FLIGHT_IDLE;
+    max_altitude = 0.0f;
 }
