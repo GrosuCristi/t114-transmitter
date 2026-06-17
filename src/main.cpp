@@ -53,10 +53,6 @@ extern "C" {
 
 #define ARM_DELAY_MS 7000UL // wait 7s after the button press before zeroing altitude
 
-// automatic disarm
-#define AUTO_DISARM_TIME_MS 300000UL // 5 minutes
-#define AUTO_DISARM_TICKS (AUTO_DISARM_TIME_MS / SAMPLE_PERIOD_MS) // Auto disarm interval in ticks
-
 // Parachute servo
 #define SERVO_PIN 33
 #define SERVO_CLOSED_ANGLE 100 // degrees: cover latched shut
@@ -69,9 +65,9 @@ extern "C" {
 //  - Tall flights coast down and deploy lower to cut drift under canopy. A
 //    descent-speed fallback still forces deployment if a long ballistic free
 //    fall builds up dangerous speed before the target altitude is reached.
-#define H_LOW_THRESHOLD_M    20.0f   // apogee below this => deploy at apogee (m)
-#define H_DEPLOY_TARGET_M    20.0f   // on descent, deploy at/below this altitude (m)
-#define V_SAFETY_FALLBACK_MS -30.0f  // deploy if descent speed exceeds this (m/s)
+#define H_LOW_THRESHOLD_M    25.0f   // apogee below this => deploy at apogee (m)
+#define H_DEPLOY_TARGET_M    25.0f   // on descent, deploy at/below this altitude (m)
+#define V_SAFETY_FALLBACK_MS -10.0f  // deploy if descent speed exceeds this (m/s)
 
 // Flight phase state machine. The single source of truth for where we are in
 // the flight; parachute deployment and telemetry logging both key off it.
@@ -92,7 +88,6 @@ SX1262 radio = new Module(SX126X_CS, SX126X_DIO1, SX126X_RESET, SX126X_BUSY);
 nrfx_timer_t timer = NRFX_TIMER_INSTANCE(1); // create an instance of timer1
 volatile uint16_t transmit_countdown = 0;
 volatile uint16_t servo_detach_countdown = 0;
-volatile uint32_t auto_disarm_countdown = 0;
 volatile bool sensor_due = false;
 
 int16_t max_timeframe_altitude = 0;
@@ -238,10 +233,6 @@ void loop()
         Serial.println(kf_accel);
     }
 
-    if (auto_disarm_countdown == 0 && is_armed) {
-        is_armed = false;
-    }
-
     if (is_armed) {
         servo_goto(SERVO_CLOSED_ANGLE);
     } else {
@@ -274,10 +265,6 @@ void timer1_isr_handler(nrf_timer_event_t event_type, void* p_context)
 
         if (servo_detach_countdown > 0) {
             servo_detach_countdown--;
-        }
-
-        if (auto_disarm_countdown > 0) {
-            auto_disarm_countdown--;
         }
     }
 }
@@ -470,7 +457,6 @@ void handle_button_press(void)
         digitalWrite(LED_GREEN, !LED_STATE_ON);
 
         is_armed = true;
-        auto_disarm_countdown = AUTO_DISARM_TICKS;
         sensor_reset_altitude(&sensor);
         kalman_reset();   // start the filter from rest at the new zero altitude
     }
