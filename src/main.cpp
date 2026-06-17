@@ -27,6 +27,12 @@ extern "C" {
 #include <kalman_factory_cleanup.h>
 }
 
+// Build mode. TEST_MODE = 1 transmits a canned altitude profile to the ground
+// station (one sample per transmit tick) instead of running the live flight
+// engine, so the radio link can be bench-tested without a real flight.
+// Set to 0 for production/flight builds.
+#define TEST_MODE 0
+
 #define SAMPLE_PERIOD_MS 10
 #define TRANSMIT_PERIOD_MS 200UL
 #define TRANSMIT_TICKS (TRANSMIT_PERIOD_MS / SAMPLE_PERIOD_MS) // Transmit interval in ticks
@@ -90,7 +96,7 @@ volatile uint16_t transmit_countdown = 0;
 volatile uint16_t servo_detach_countdown = 0;
 volatile bool sensor_due = false;
 
-int16_t max_timeframe_altitude = 0;
+int8_t max_timeframe_altitude = 0;
 
 bool is_armed = false;
 flight_state_t flight_state = FLIGHT_IDLE;
@@ -108,9 +114,19 @@ float kf_accel = 0.0f;
 kalman_t* kf = nullptr;
 kalman_measurement_t* kfm = nullptr;
 
-int16_t altitude_samples[ALT_SAMPLES_ARRAY_LENGTH] = {0};
-uint16_t altitude_sample_idx = 0;
+int8_t altitude_samples[ALT_SAMPLES_ARRAY_LENGTH] = {0};
+int8_t altitude_sample_idx = 0;
 bool samples_transmitted = false;
+
+#if TEST_MODE
+const int8_t test_altitude_samples[ALT_SAMPLES_ARRAY_LENGTH] = {
+      0,   2,   6,  13,  21,  32,  44,  57,  69,  80,
+     88,  93,  96,  96,  95,  92,  88,  82,  76,  69,
+     63,  56,  51,  45,  40,  35,  31,  26,  23,  19,
+     16,  13,  10,   8,   6,   4,   3,   1,   1,   0,
+};
+int8_t test_sample_idx = 0;
+#endif
 
 Sensor sensor;
 
@@ -120,7 +136,7 @@ Servo servo;
 Function prototypes
 *******************************************************************************/
 void timer1_isr_handler(nrf_timer_event_t event_type, void* p_context);
-void send_to_ground(int16_t altitude);
+void send_to_ground(int8_t altitude);
 void panic(const char* msg);
 void handle_sensor_reading(void);
 void flight_engine_routine(void);
@@ -211,10 +227,19 @@ void loop()
         }
     }
 
-    // Transmit only while flying
     if (transmit_countdown == 0 ) {
         transmit_countdown = TRANSMIT_TICKS;
 
+#if TEST_MODE
+        // Walk the canned profile, sending one sample per transmit tick so the
+        // ground station sees a live-looking altitude stream with no hardware.
+        for (test_sample_idx = 0; test_sample_idx < ALT_SAMPLES_ARRAY_LENGTH; test_sample_idx++) {
+            send_to_ground(test_altitude_samples[test_sample_idx]);
+            Serial.println(test_altitude_samples[test_sample_idx]);
+            delay(20);
+        }
+        delay(20000);
+#else
         if (flight_state != FLIGHT_IDLE && flight_state != FLIGHT_DEPLOYED &&
             altitude_sample_idx < ALT_SAMPLES_ARRAY_LENGTH) {
             altitude_samples[altitude_sample_idx] = max_timeframe_altitude;
@@ -231,6 +256,7 @@ void loop()
         Serial.print(kf_velocity);
         Serial.print(' ');
         Serial.println(kf_accel);
+#endif
     }
 
     if (is_armed) {
@@ -269,10 +295,10 @@ void timer1_isr_handler(nrf_timer_event_t event_type, void* p_context)
     }
 }
 
-void send_to_ground(int16_t altitude)
+void send_to_ground(int8_t altitude)
 {
     digitalWrite(LED_GREEN, LED_STATE_ON);
-    int state = radio.transmit((uint8_t*)&altitude, sizeof(int16_t));
+    int state = radio.transmit((uint8_t*)&altitude, sizeof(int8_t));
     if (state != RADIOLIB_ERR_NONE) {
         Serial.printf("  failed, code %d\n", state);
     }
@@ -314,7 +340,7 @@ void flight_engine_routine(void)
     // Track the peak filtered altitude for the telemetry graph and, separately,
     // the highest altitude this flight (drives the apogee deploy-strategy branch).
     if (kf_altitude > max_timeframe_altitude) {
-        max_timeframe_altitude = (int16_t)kf_altitude;
+        max_timeframe_altitude = (int8_t)kf_altitude;
     }
     if (kf_altitude > max_altitude) {
         max_altitude = kf_altitude;
@@ -475,8 +501,9 @@ void button_update(void)
 
 void handle_transmit_samples(void)
 {
-    for (uint16_t i = 0; i < altitude_sample_idx; i++) {
+    for (int8_t i = 0; i < altitude_sample_idx; i++) {
         send_to_ground(altitude_samples[i]);
+        delay(20);
     }
 }
 

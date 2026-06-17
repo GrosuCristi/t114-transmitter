@@ -114,6 +114,10 @@ bool sensor_update(Sensor* s)
     s->absolute_altitude = 44330.0f * (1.0f - powf(s->pressure / s->sea_level_hpa, 0.1903f));
     s->altitude = s->absolute_altitude + s->altitude_offset;
 
+    // Cap at +127 m, floor at -128 m.
+    if (s->altitude > 127.0f)  s->altitude = 127.0f;
+    if (s->altitude < -128.0f) s->altitude = -128.0f;
+
     return true;
 }
 
